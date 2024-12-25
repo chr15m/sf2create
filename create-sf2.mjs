@@ -1,23 +1,13 @@
 /**
  * create-sf2.mjs
  *
- * A minimal, high-level library to build SF2 (SoundFont v2) files
- * in JavaScript, returning them as a Blob. This version:
- *   - If valid loop points are provided (loopStart < loopEnd), sets sampleModes=1 (loop).
- *   - Otherwise, sets sampleModes=0 (no loop) and chooses loop points at the end of the sample
- *     (i.e., loopStart = numFrames - 1, loopEnd = numFrames).
- *   - **Fix**: Convert local loopStart/loopEnd to absolute offsets in the smpl chunk for shdr.
+ * A high-level library to build SF2 (SoundFont v2) files in JavaScript,
+ * returning them as a Blob. This version aggregates notes that map
+ * to the same "closest sample" into a single zone.
  */
 
-//
 // 0. Helpful utilities
-//
 
-/**
- * Convert from Float32 samples [-1.0, 1.0] to 16-bit signed PCM.
- * @param {Float32Array} floatArray
- * @returns {Int16Array}
- */
 function float32ToInt16(floatArray) {
   const int16 = new Int16Array(floatArray.length);
   for (let i = 0; i < floatArray.length; i++) {
@@ -31,16 +21,9 @@ function float32ToInt16(floatArray) {
   return int16;
 }
 
-/**
- * Write a string into a DataView, ASCII-encoded, with trailing zeros up to length.
- * @param {DataView} view
- * @param {number} offset
- * @param {string} str
- * @param {number} length
- */
 function writeFixedAsciiString(view, offset, str, length) {
-  const encoder = new TextEncoder(); // default UTF-8
-  const bytes = encoder.encode(str.slice(0, length)); // trim to max length
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(str.slice(0, length));
   let i = 0;
   for (; i < bytes.length && i < length; i++) {
     view.setUint8(offset + i, bytes[i]);
@@ -51,10 +34,8 @@ function writeFixedAsciiString(view, offset, str, length) {
 }
 
 /**
- * Prepare the samples data structure:
- *   - Convert rawMonoData => pcm16
- *   - Determine if loop points are valid
- *   - Assign loopStart, loopEnd, and sampleMode (0=no loop, 1=continuous loop)
+ * Convert the user’s sample data => an array of objects
+ * with { pcm16, sampleRate, rootNote, loopStart, loopEnd, sampleMode, ... }
  */
 function prepareSamples(data) {
   const allSamples = [];
@@ -67,16 +48,22 @@ function prepareSamples(data) {
       sampleRate: 44100,
       rootNote: 60,
       loopStart: 0,
-      loopEnd: 1, // minimal region at the end
+      loopEnd: 1, // minimal region
       sampleMode: 0, // no loop
-      noteRange: [0, 127],
       channels: 1
     });
     return allSamples;
   }
 
+  // Optionally sort by rootNote (useful for debugging)
+  const userSamples = data.samples.slice().sort((a, b) => {
+    const rA = (a.rootNote == null) ? 60 : a.rootNote;
+    const rB = (b.rootNote == null) ? 60 : b.rootNote;
+    return rA - rB;
+  });
+
   let idx = 0;
-  for (const s of data.samples) {
+  for (const s of userSamples) {
     const rawMonoData = s.rawMonoData || new Float32Array([0]);
     const pcm16 = float32ToInt16(rawMonoData);
     const numFrames = pcm16.length;
@@ -84,22 +71,22 @@ function prepareSamples(data) {
     const sr = s.sampleRate || 44100;
     const root = (s.rootNote === undefined) ? 60 : s.rootNote;
 
-    // Default: no loop, we set the loop region to [numFrames-1..numFrames]
-    let sampleMode = 0; // 0 => no loop
+    // Default: no loop
+    let sampleMode = 0;
     let loopStartVal = numFrames - 1;
     let loopEndVal = numFrames;
 
-    // If user gave valid loop points, enable continuous looping
+    // If user gave valid loop points => continuous loop
     if (
-      typeof s.loopStart === 'number' && 
+      typeof s.loopStart === 'number' &&
       typeof s.loopEnd === 'number' &&
-      s.loopEnd > s.loopStart && 
-      s.loopStart >= 0 && 
+      s.loopEnd > s.loopStart &&
+      s.loopStart >= 0 &&
       s.loopEnd <= numFrames
     ) {
-      sampleMode = 1; 
+      sampleMode = 1;
       loopStartVal = s.loopStart;
-      loopEndVal   = s.loopEnd;
+      loopEndVal = s.loopEnd;
     }
 
     allSamples.push({
@@ -109,8 +96,7 @@ function prepareSamples(data) {
       rootNote: root,
       loopStart: loopStartVal,
       loopEnd: loopEndVal,
-      sampleMode, 
-      noteRange: s.noteRange || [0, 127],
+      sampleMode,
       channels: 1
     });
     idx++;
@@ -120,55 +106,92 @@ function prepareSamples(data) {
 }
 
 /**
- * Build a naive note->sample map if needed
+ * Create note->sample mapping by picking the sample with the *closest* rootNote to each MIDI note.
+ *
+ * Returns an array of length 128. Each entry is the index in allSamples that is the best match.
  */
-function buildNoteToSampleMap(allSamples) {
-  const map = new Array(128).fill(null);
+function buildNoteToSampleIndex(allSamples) {
+  // For convenience, store the rootNote of each sample
+  const roots = allSamples.map(s => s.rootNote);
+
+  const map = new Array(128);
   for (let note = 0; note < 128; note++) {
-    // pick the first sample covering this note
-    let chosen = null;
-    for (const s of allSamples) {
-      if (note >= s.noteRange[0] && note <= s.noteRange[1]) {
-        chosen = s;
-        break;
+    let bestSampleID = 0;
+    let bestDiff = Infinity;
+
+    for (let sIdx = 0; sIdx < allSamples.length; sIdx++) {
+      const diff = Math.abs(note - roots[sIdx]);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestSampleID = sIdx;
       }
     }
-    // fallback to the closest root note
-    if (!chosen) {
-      let bestDiff = Infinity;
-      for (const s of allSamples) {
-        const diff = Math.abs(note - s.rootNote);
-        if (diff < bestDiff) {
-          bestDiff = diff;
-          chosen = s;
-        }
-      }
-    }
-    map[note] = chosen;
+    map[note] = bestSampleID;
   }
   return map;
 }
 
 /**
- * createSf2File
+ * Build a set of instrument zones (key ranges) from the note->sample mapping.
+ * We'll group consecutive notes that map to the same sample into one zone.
  *
- * Builds a minimal SoundFont with exactly one preset (0), one instrument (0), and
- * references the FIRST sample in 'allSamples' as a zone. The rest of the samples
- * are included in 'shdr' but not actually used in the instrument zone. 
+ * Returns an array of zone objects of the form:
+ *   {
+ *     keyLo: number,
+ *     keyHi: number,
+ *     sampleID: number,
+ *     sampleMode: 0|1
+ *   }
  */
+function buildInstrumentZones(allSamples, noteToSample) {
+  const zones = [];
+  let currSample = noteToSample[0];
+  let zoneStart = 0;
+
+  for (let note = 1; note < 128; note++) {
+    const sID = noteToSample[note];
+    if (sID !== currSample) {
+      // close out the previous zone
+      zones.push({
+        keyLo: zoneStart,
+        keyHi: note - 1,
+        sampleID: currSample,
+        sampleMode: allSamples[currSample].sampleMode
+      });
+      // start a new zone
+      zoneStart = note;
+      currSample = sID;
+    }
+  }
+
+  // final zone
+  zones.push({
+    keyLo: zoneStart,
+    keyHi: 127,
+    sampleID: currSample,
+    sampleMode: allSamples[currSample].sampleMode
+  });
+
+  return zones;
+}
+
 export function createSf2File(data) {
-  // 1) Convert and gather samples
+  // 1) Convert user samples -> allSamples
   const allSamples = prepareSamples(data);
 
-  // 2) Build a note->sample mapping (unused in minimal example)
-  const noteMap = buildNoteToSampleMap(allSamples);
+  // 2) For each note [0..127], find the sample with the closest rootNote
+  const noteMap = buildNoteToSampleIndex(allSamples);
 
-  // 3) Allocate a large buffer
+  // 3) Group consecutive notes that share the same sample => instrument zones
+  const zoneDefs = buildInstrumentZones(allSamples, noteMap);
+
+  // 4) Prepare to write the SF2
   const approximateSize = 4 * 1024 * 1024;
   const buffer = new ArrayBuffer(approximateSize);
   const view = new DataView(buffer);
   let offset = 0;
 
+  // Helper writers
   function writeUint32(val) {
     view.setUint32(offset, val, true);
     offset += 4;
@@ -188,7 +211,6 @@ export function createSf2File(data) {
     }
   }
 
-  // Write a sub-chunk <id> <size> <payload> with alignment
   function writeChunk(id, payloadFn) {
     writeFourCC(id);
     const sizeOffset = offset;
@@ -199,29 +221,29 @@ export function createSf2File(data) {
 
     let chunkEnd = offset;
     let chunkSize = chunkEnd - chunkStart;
-
-    // Word alignment (2 bytes) for SF2
+    // Word align
     if (chunkSize % 2 !== 0) {
       writeUint8(0);
-      chunkEnd = offset;
+      chunkEnd++;
       chunkSize++;
     }
-
     const savedPos = offset;
     offset = sizeOffset;
     writeUint32(chunkSize, true);
     offset = savedPos;
   }
 
-  // -----------------------------------------------------
-  //  Top-level RIFF chunk
-  // -----------------------------------------------------
+  // ------------------------
+  // RIFF + sfbk
+  // ------------------------
   writeFourCC('RIFF');
   const totalSizeOffset = offset;
-  writeUint32(0); // placeholder for RIFF size
+  writeUint32(0); // placeholder
   writeFourCC('sfbk');
 
-  // 1) LIST "INFO"
+  // ------------------------
+  // LIST "INFO"
+  // ------------------------
   writeChunk('LIST', () => {
     writeFourCC('INFO');
 
@@ -261,17 +283,19 @@ export function createSf2File(data) {
     }
   });
 
-  // 2) LIST "sdta" => "smpl"
+  // ------------------------
+  // LIST "sdta" => smpl
+  // ------------------------
   writeChunk('LIST', () => {
     writeFourCC('sdta');
     writeChunk('smpl', () => {
+      // Write each sample + 46 guard points
       for (const s of allSamples) {
         const pcm = s.pcm16;
-        // main data
         for (let i = 0; i < pcm.length; i++) {
           writeUint16(pcm[i]);
         }
-        // guard frames (46)
+        // Guard frames (46)
         for (let i = 0; i < 46; i++) {
           writeUint16(0);
         }
@@ -279,15 +303,17 @@ export function createSf2File(data) {
     });
   });
 
-  // 3) LIST "pdta" => phdr, pbag, pmod, pgen, inst, ibag, imod, igen, shdr
+  // ------------------------
+  // LIST "pdta"
+  // ------------------------
   writeChunk('LIST', () => {
     writeFourCC('pdta');
 
-    // phdr (Preset Header)
+    // ---- phdr ----
     writeChunk('phdr', () => {
-      // One preset + terminal
+      // We create exactly 1 preset + terminal
       const presetName = data.name || 'Preset';
-      // 1) Preset record (38 bytes)
+      // Preset record (38 bytes)
       for (let i = 0; i < 20; i++) {
         writeUint8(i < presetName.length ? presetName.charCodeAt(i) : 0);
       }
@@ -305,68 +331,85 @@ export function createSf2File(data) {
       }
       writeUint16(0);
       writeUint16(0);
-      writeUint16(1); // pbag index
+      writeUint16(1); // pbag index => after 1 bag
       writeUint32(0);
       writeUint32(0);
       writeUint32(0);
     });
 
-    // pbag
+    // ---- pbag ----
     writeChunk('pbag', () => {
-      // 1 bag + terminal
-      writeUint16(0); // pgen index
-      writeUint16(0); // pmod index
+      // 1 bag + terminal => 2 records total
+      // bag #0 => references pgen #0
+      writeUint16(0); // wGenNdx
+      writeUint16(0); // wModNdx
       // terminal
       writeUint16(1);
       writeUint16(0);
     });
 
-    // pmod
+    // ---- pmod ----
     writeChunk('pmod', () => {
       // no modulators + terminal
-      // 1 terminal record of 10 bytes
       for (let i = 0; i < 10; i++) {
         writeUint8(0);
       }
     });
 
-    // pgen
+    // ---- pgen ----
     writeChunk('pgen', () => {
-      // One generator => instrument #0, then terminal
+      // One generator => instrument=0
       // GenOper=41 => instrument
       writeUint16(41);
-      writeUint16(0); // instrument=0
+      writeUint16(0);
       // terminal
       writeUint16(0);
       writeUint16(0);
     });
 
-    // inst
+    // ---- inst ----
     writeChunk('inst', () => {
-      // 1 instrument => terminal
+      // 1 instrument => name, wInstBagNdx=0 => then terminal
       const instName = data.name || 'Instrument';
       writeFixedAsciiString(view, offset, instName, 20);
       offset += 20;
-      // ibag index
+      // wInstBagNdx => first bag
       writeUint16(0);
 
       // "EOI"
       writeFixedAsciiString(view, offset, 'EOI', 20);
       offset += 20;
-      writeUint16(1);
+      // wInstBagNdx => zoneDefs.length => next after all zones
+      writeUint16(zoneDefs.length);
     });
 
-    // ibag
+    // ---- ibag ----
     writeChunk('ibag', () => {
-      // 1 bag + terminal
-      writeUint16(0); // igenIndex
-      writeUint16(0); // imodIndex
-      // terminal
-      writeUint16(1);
+      // We'll create one bag per zone, plus a terminal bag
+      // Each bag references the next generator index (in IGEN)
+      let genOffset = 0;
+
+      // For each zone, we might have 2 or 3 generators:
+      //   keyRange (GenOper=43)
+      //   [sampleModes if looped => GenOper=54]
+      //   sampleID (GenOper=53)
+      for (let i = 0; i < zoneDefs.length; i++) {
+        writeUint16(genOffset); // wInstGenNdx
+        writeUint16(0);         // wInstModNdx => no modulators
+        // Count how many gens
+        let count = 2; // keyRange + sampleID
+        if (zoneDefs[i].sampleMode === 1) {
+          count++;
+        }
+        genOffset += count;
+      }
+
+      // Terminal bag
+      writeUint16(genOffset);
       writeUint16(0);
     });
 
-    // imod
+    // ---- imod ----
     writeChunk('imod', () => {
       // no modulators + terminal
       for (let i = 0; i < 10; i++) {
@@ -374,31 +417,35 @@ export function createSf2File(data) {
       }
     });
 
-    // igen
+    // ---- igen ----
     writeChunk('igen', () => {
-      // Single zone referencing the FIRST sample in allSamples
-      if (allSamples.length > 0) {
-        const firstSample = allSamples[0];
-        // If it's looped, sampleModes => GenOper=54, amount=1 => loop_continuous
-        if (firstSample.sampleMode === 1) {
-          writeUint16(54); // sampleModes
-          writeUint16(1);  // loop_continuous
+      // For each zone => keyRange, optional sampleModes, sampleID
+      for (const z of zoneDefs) {
+        // keyRange => GenOper=43
+        // 16-bit param: (hi << 8) | lo
+        const keyRangeVal = (z.keyHi << 8) | z.keyLo;
+        writeUint16(43);
+        writeUint16(keyRangeVal);
+
+        // If loop => sampleModes => GenOper=54, value=1
+        if (z.sampleMode === 1) {
+          writeUint16(54);
+          writeUint16(1); // loop_continuous
         }
 
         // sampleID => GenOper=53
-        // referencing sample #0 in shdr
         writeUint16(53);
-        writeUint16(0);
+        writeUint16(z.sampleID);
       }
-      // Terminal
+
+      // Terminal generator
       writeUint16(0);
       writeUint16(0);
     });
 
-    // shdr (Sample Headers)
+    // ---- shdr ----
     writeChunk('shdr', () => {
       let startPos = 0;
-
       for (let i = 0; i < allSamples.length; i++) {
         const s = allSamples[i];
         const sampleName = s.name;
@@ -408,59 +455,53 @@ export function createSf2File(data) {
         offset += 20;
 
         const numFrames = s.pcm16.length;
-        // The "guard" is 46 frames => total = numFrames + 46
         const endPos = startPos + numFrames;
 
-        // Convert local loop points => absolute offsets
+        // Convert local loop => absolute offsets
         const realLoopStart = startPos + s.loopStart;
-        const realLoopEnd   = startPos + s.loopEnd;
+        const realLoopEnd = startPos + s.loopEnd;
 
-        // 1) start
+        // start
         writeUint32(startPos);
-        // 2) end
+        // end
         writeUint32(endPos);
-        // 3) loopStart
+        // loopStart
         writeUint32(realLoopStart);
-        // 4) loopEnd
+        // loopEnd
         writeUint32(realLoopEnd);
-        // 5) sampleRate
+        // sampleRate
         writeUint32(s.sampleRate);
-        // 6) originalPitch
+        // originalPitch
         writeUint8(s.rootNote);
-        // 7) pitchCorrection
+        // pitchCorrection
         writeUint8(0);
-        // 8) sampleLink
+        // sampleLink
         writeUint16(0);
-        // 9) sampleType (1=mono)
+        // sampleType => 1=mono
         writeUint16(1);
 
-        // Move to next sample's region: + numFrames + guard
+        // Move forward in the PCM data region
         startPos += (numFrames + 46);
       }
 
-      // Terminal "EOS"
+      // Terminal sample: "EOS"
       writeFixedAsciiString(view, offset, 'EOS', 20);
       offset += 20;
-      // Fill up rest (start, end, loopStart, loopEnd, sampleRate)
       for (let i = 0; i < 5; i++) {
         writeUint32(0);
       }
-      // root, correction
       writeUint8(0);
       writeUint8(0);
-      // link, type
       writeUint16(0);
       writeUint16(0);
     });
   });
 
-  // Done writing. The file length is offset bytes.
+  // Finalize
   const fileEnd = offset;
-  // By RIFF spec, the size after "RIFF" is (fileEnd - 8).
-  const riffSize = fileEnd - 8;
+  const riffSize = fileEnd - 8; // after "RIFF"
   view.setUint32(totalSizeOffset, riffSize, true);
 
-  // Return only the used portion as a Blob
   return new Blob([buffer.slice(0, fileEnd)], {
     type: 'application/octet-stream',
   });
