@@ -6,7 +6,8 @@ import { fileURLToPath, pathToFileURL } from 'url';
 import path from 'path';
 import wav from 'node-wav';
 
-// Be sure create-sf2.mjs is in the same folder or adjust the path as needed
+// Be sure create-sf2.mjs is in the same folder or adjust as needed.
+// This should be the stereo-capable version you wrote previously.
 import { createSf2File } from './create-sf2.mjs';
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -38,22 +39,56 @@ function noteNameToMidi(noteName) {
 }
 
 function extractNoteName(filename) {
-  // E.g. "Banjo_Common - A3.wav" -> "A3"
-  //      "Banjo_Common - G#4.wav" -> "G#4"
+  // E.g. "Banjo_Common - A3.wav" => "A3"
+  //      "Banjo_Common - G#4.wav" => "G#4"
   const notePattern = /([A-G][#b]?-?\d+)/;
   const match = notePattern.exec(filename);
   return match ? match[1] : null;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// 2) Read WAV data as Float32 arrays
+// 2) Read WAV data, detect mono/stereo
 ////////////////////////////////////////////////////////////////////////////////
 
-async function readWavAsFloat32(filePath) {
+/**
+ * readWavFile(filePath) -> {
+ *   channels: 1 or 2,
+ *   sampleRate: number,
+ *   data: Float32Array (for mono => rawMonoData, for stereo => rawStereoData)
+ * }
+ */
+async function readWavFile(filePath) {
   const buffer = await readFile(filePath);
-  const result = wav.decode(buffer);
-  // result.channelData is an array of Float32Arrays (one per channel)
-  return result.channelData[0]; // pick the first channel for simplicity
+  const result = wav.decode(buffer); 
+  const { sampleRate, channelData } = result;
+
+  if (channelData.length === 1) {
+    // ----- MONO -----
+    return {
+      channels: 1,
+      sampleRate,
+      data: channelData[0]
+    };
+  } else if (channelData.length === 2) {
+    // ----- STEREO -----
+    const left  = channelData[0];
+    const right = channelData[1];
+    const numFrames = Math.min(left.length, right.length);
+    // Interleave [L0, R0, L1, R1, ...]
+    const interleaved = new Float32Array(numFrames * 2);
+    for (let i = 0; i < numFrames; i++) {
+      interleaved[2*i]   = left[i];
+      interleaved[2*i+1] = right[i];
+    }
+    return {
+      channels: 2,
+      sampleRate,
+      data: interleaved
+    };
+  } else {
+    // More than 2 channels not supported in this minimal example
+    throw new Error(`Unsupported channel count: ${channelData.length}`);
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -76,7 +111,7 @@ async function main() {
     const basename = path.basename(wavPath);
     const noteStr = extractNoteName(basename);
     if (!noteStr) {
-      console.warn(`Skipping "${basename}": no note name found.`);
+      console.warn(`Skipping "${basename}": no note name found in filename.`);
       continue;
     }
 
@@ -90,21 +125,33 @@ async function main() {
 
     console.log(`Reading "${basename}" -> note: ${noteStr}, MIDI: ${midiNote}`);
 
-    let wavData;
+    let wavInfo;
     try {
-      wavData = await readWavAsFloat32(wavPath);
+      wavInfo = await readWavFile(wavPath);
     } catch (err) {
       console.error(`Error reading WAV "${wavPath}":`, err);
       continue;
     }
 
-    samples.push({
+    const { channels, sampleRate, data } = wavInfo;
+
+    // Prepare the sample object for our SoundFont builder
+    // (If channels=1 => rawMonoData, if channels=2 => rawStereoData)
+    const sampleObj = {
       name: basename.replace('.wav', ''),
-      rawMonoData: wavData,
-      sampleRate: 44100,
+      sampleRate,
       rootNote: midiNote,
-      noteRange: [0, 127]
-    });
+      noteRange: [0, 127], // cover full range unless you want narrower
+      channels
+    };
+
+    if (channels === 1) {
+      sampleObj.rawMonoData = data;
+    } else {
+      sampleObj.rawStereoData = data;
+    }
+
+    samples.push(sampleObj);
   }
 
   if (samples.length === 0) {
@@ -128,10 +175,8 @@ async function main() {
 }
 
 // ---------------------------------------------------------------------------
-// If you only run this script via `node create-sf2-from-wavs.mjs`, you can
-// either remove this check, or do a proper fileURL comparison:
+// If invoked directly (instead of imported), run main():
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
-  // The script is being executed directly
   main().catch((err) => {
     console.error('Unhandled error:', err);
     process.exit(1);

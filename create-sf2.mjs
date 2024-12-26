@@ -41,65 +41,138 @@ function prepareSamples(data) {
   const allSamples = [];
 
   if (!data.samples || data.samples.length === 0) {
-    // If no samples given, create a trivial silent sample
+    // Trivial silent sample
     allSamples.push({
       name: 'Empty',
       pcm16: new Int16Array([0, 0, 0, 0]),
       sampleRate: 44100,
       rootNote: 60,
       loopStart: 0,
-      loopEnd: 1, // minimal region
-      sampleMode: 0, // no loop
-      channels: 1
+      loopEnd: 1,
+      sampleMode: 0,      // no loop
+      sampleLink: 0,      // no link
+      sampleType: 1,      // mono
+      channels: 1,
     });
     return allSamples;
   }
 
-  // Optionally sort by rootNote (useful for debugging)
-  const userSamples = data.samples.slice().sort((a, b) => {
-    const rA = (a.rootNote == null) ? 60 : a.rootNote;
-    const rB = (b.rootNote == null) ? 60 : b.rootNote;
-    return rA - rB;
-  });
-
   let idx = 0;
-  for (const s of userSamples) {
-    const rawMonoData = s.rawMonoData || new Float32Array([0]);
-    const pcm16 = float32ToInt16(rawMonoData);
-    const numFrames = pcm16.length;
-    const name = s.name || `sample_${idx}`;
-    const sr = s.sampleRate || 44100;
-    const root = (s.rootNote === undefined) ? 60 : s.rootNote;
+  for (const userS of data.samples) {
+    const name = userS.name || `sample_${idx}`;
+    const sr = userS.sampleRate || 44100;
+    const root = (userS.rootNote === undefined) ? 60 : userS.rootNote;
 
-    // Default: no loop
-    let sampleMode = 0;
-    let loopStartVal = numFrames - 1;
-    let loopEndVal = numFrames;
-
-    // If user gave valid loop points => continuous loop
-    if (
-      typeof s.loopStart === 'number' &&
-      typeof s.loopEnd === 'number' &&
-      s.loopEnd > s.loopStart &&
-      s.loopStart >= 0 &&
-      s.loopEnd <= numFrames
-    ) {
-      sampleMode = 1;
-      loopStartVal = s.loopStart;
-      loopEndVal = s.loopEnd;
+    // Decide loop info
+    function computeLoop(numFrames) {
+      let mode = 0, start = numFrames - 1, end = numFrames;
+      if (
+        typeof userS.loopStart === 'number' &&
+        typeof userS.loopEnd === 'number' &&
+        userS.loopEnd > userS.loopStart &&
+        userS.loopStart >= 0 &&
+        userS.loopEnd <= numFrames
+      ) {
+        mode = 1;
+        start = userS.loopStart;
+        end   = userS.loopEnd;
+      }
+      return {mode, start, end};
     }
 
-    allSamples.push({
-      name,
-      pcm16,
-      sampleRate: sr,
-      rootNote: root,
-      loopStart: loopStartVal,
-      loopEnd: loopEndVal,
-      sampleMode,
-      channels: 1
-    });
+    if (userS.channels === 2) {
+      // ----- STEREO sample -----
+      // We expect userS.rawStereoData: Float32Array interleaved [L0, R0, L1, R1, ...]
+      const stereo = userS.rawStereoData || new Float32Array([0,0]);
+      const numFrames = stereo.length / 2;
+      // Split out left[] and right[] as Float32
+      const leftF  = new Float32Array(numFrames);
+      const rightF = new Float32Array(numFrames);
+      for (let i = 0; i < numFrames; i++) {
+        leftF[i]  = stereo[2*i];
+        rightF[i] = stereo[2*i + 1];
+      }
+      // Convert to Int16
+      const leftPCM  = float32ToInt16(leftF);
+      const rightPCM = float32ToInt16(rightF);
+
+      // Compute loop region (shared by both channels)
+      const {mode, start, end} = computeLoop(numFrames);
+
+      // Create the left-channel sample record
+      const leftRecord = {
+        name: name + ' L',
+        pcm16: leftPCM,
+        sampleRate: sr,
+        rootNote: root,
+        loopStart: start,
+        loopEnd: end,
+        sampleMode: mode,      
+        sampleLink: 0,         // placeholder
+        sampleType: 1,         // left channel
+        channels: 2,           // user had 2
+      };
+      // Create the right-channel sample record
+      const rightRecord = {
+        name: name + ' R',
+        pcm16: rightPCM,
+        sampleRate: sr,
+        rootNote: root,
+        loopStart: start,
+        loopEnd: end,
+        sampleMode: mode,
+        sampleLink: 0,         // placeholder
+        sampleType: 2,         // right channel
+        channels: 2,
+      };
+
+      // We'll push them in the array. We can fill in sampleLink afterwards once we know their final indexes.
+      allSamples.push(leftRecord, rightRecord);
+
+    } else {
+      // ----- MONO sample -----
+      const raw = userS.rawMonoData || new Float32Array([0]);
+      const pcm16 = float32ToInt16(raw);
+      const numFrames = pcm16.length;
+      const {mode, start, end} = computeLoop(numFrames);
+
+      allSamples.push({
+        name: name,
+        pcm16,
+        sampleRate: sr,
+        rootNote: root,
+        loopStart: start,
+        loopEnd: end,
+        sampleMode: mode,
+        sampleLink: 0,
+        sampleType: 1,  // mono
+        channels: 1,
+      });
+    }
+
     idx++;
+  }
+
+  // Now fix up sampleLink for stereo pairs
+  // We'll iterate through allSamples. If we find consecutive entries
+  // that share the same “parent name” + " L" / " R" and have channels=2, link them.
+  // This is somewhat simplistic; you might want a more robust pairing approach.
+  for (let i = 0; i < allSamples.length - 1; i++) {
+    const s1 = allSamples[i];
+    const s2 = allSamples[i+1];
+    if (
+      s1.channels === 2 &&
+      s2.channels === 2 &&
+      s1.name.endsWith(' L') &&
+      s2.name.endsWith(' R') &&
+      s1.name.slice(0, -2) === s2.name.slice(0, -2)
+    ) {
+      // s1 is left, s2 is right
+      const leftIndex  = i;
+      const rightIndex = i+1;
+      s1.sampleLink = rightIndex;  // left links to right
+      s2.sampleLink = leftIndex;   // right links to left
+    }
   }
 
   return allSamples;
@@ -295,7 +368,7 @@ export function createSf2File(data) {
         for (let i = 0; i < pcm.length; i++) {
           writeUint16(pcm[i]);
         }
-        // Guard frames (46)
+        // Guard frames
         for (let i = 0; i < 46; i++) {
           writeUint16(0);
         }
@@ -446,20 +519,17 @@ export function createSf2File(data) {
     // ---- shdr ----
     writeChunk('shdr', () => {
       let startPos = 0;
+      // in the "shdr" chunk
       for (let i = 0; i < allSamples.length; i++) {
         const s = allSamples[i];
-        const sampleName = s.name;
-
-        // Write sample name (20 chars)
-        writeFixedAsciiString(view, offset, sampleName, 20);
+        writeFixedAsciiString(view, offset, s.name, 20);
         offset += 20;
 
         const numFrames = s.pcm16.length;
         const endPos = startPos + numFrames;
 
-        // Convert local loop => absolute offsets
         const realLoopStart = startPos + s.loopStart;
-        const realLoopEnd = startPos + s.loopEnd;
+        const realLoopEnd   = startPos + s.loopEnd;
 
         // start
         writeUint32(startPos);
@@ -475,12 +545,13 @@ export function createSf2File(data) {
         writeUint8(s.rootNote);
         // pitchCorrection
         writeUint8(0);
-        // sampleLink
-        writeUint16(0);
-        // sampleType => 1=mono
-        writeUint16(1);
 
-        // Move forward in the PCM data region
+        // sampleLink
+        writeUint16(s.sampleLink);
+        // sampleType
+        writeUint16(s.sampleType);
+
+        // Move forward for the next sample's region
         startPos += (numFrames + 46);
       }
 
