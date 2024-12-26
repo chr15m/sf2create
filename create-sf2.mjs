@@ -3,7 +3,8 @@
  *
  * A high-level library to build SF2 (SoundFont v2) files in JavaScript,
  * returning them as a Blob. This version aggregates notes that map
- * to the same "closest sample" into a single zone.
+ * to the same "closest sample" into a single zone, supports stereo,
+ * includes global regions for OpenMPT, AND adds left/right pan.
  */
 
 // 0. Helpful utilities
@@ -35,7 +36,7 @@ function writeFixedAsciiString(view, offset, str, length) {
 
 /**
  * Convert the user’s sample data => an array of objects
- * with { pcm16, sampleRate, rootNote, loopStart, loopEnd, sampleMode, ... }
+ * with { pcm16, sampleRate, rootNote, loopStart, loopEnd, sampleMode, sampleLink, sampleType, ... }.
  */
 function prepareSamples(data) {
   const allSamples = [];
@@ -49,9 +50,9 @@ function prepareSamples(data) {
       rootNote: 60,
       loopStart: 0,
       loopEnd: 1,
-      sampleMode: 0,      // no loop
-      sampleLink: 0,      // no link
-      sampleType: 1,      // mono
+      sampleMode: 0, // no loop
+      sampleLink: 0,
+      sampleType: 1, // mono
       channels: 1,
     });
     return allSamples;
@@ -63,9 +64,10 @@ function prepareSamples(data) {
     const sr = userS.sampleRate || 44100;
     const root = (userS.rootNote === undefined) ? 60 : userS.rootNote;
 
-    // Decide loop info
     function computeLoop(numFrames) {
-      let mode = 0, start = numFrames - 1, end = numFrames;
+      let mode = 0,
+        start = numFrames - 1,
+        end = numFrames;
       if (
         typeof userS.loopStart === 'number' &&
         typeof userS.loopEnd === 'number' &&
@@ -75,66 +77,58 @@ function prepareSamples(data) {
       ) {
         mode = 1;
         start = userS.loopStart;
-        end   = userS.loopEnd;
+        end = userS.loopEnd;
       }
-      return {mode, start, end};
+      return { mode, start, end };
     }
 
     if (userS.channels === 2) {
       // ----- STEREO sample -----
-      // We expect userS.rawStereoData: Float32Array interleaved [L0, R0, L1, R1, ...]
-      const stereo = userS.rawStereoData || new Float32Array([0,0]);
+      const stereo = userS.rawStereoData || new Float32Array([0, 0]);
       const numFrames = stereo.length / 2;
-      // Split out left[] and right[] as Float32
-      const leftF  = new Float32Array(numFrames);
+      const leftF = new Float32Array(numFrames);
       const rightF = new Float32Array(numFrames);
       for (let i = 0; i < numFrames; i++) {
-        leftF[i]  = stereo[2*i];
-        rightF[i] = stereo[2*i + 1];
+        leftF[i] = stereo[2 * i];
+        rightF[i] = stereo[2 * i + 1];
       }
-      // Convert to Int16
-      const leftPCM  = float32ToInt16(leftF);
+      const leftPCM = float32ToInt16(leftF);
       const rightPCM = float32ToInt16(rightF);
 
-      // Compute loop region (shared by both channels)
-      const {mode, start, end} = computeLoop(numFrames);
+      const { mode, start, end } = computeLoop(numFrames);
 
-      // Create the left-channel sample record
       const leftRecord = {
-        name: name + ' L',
+        name: name.slice(0, 17).replaceAll(' ', '') + '_L',
         pcm16: leftPCM,
         sampleRate: sr,
         rootNote: root,
         loopStart: start,
         loopEnd: end,
-        sampleMode: mode,      
-        sampleLink: 0,         // placeholder
-        sampleType: 1,         // left channel
-        channels: 2,           // user had 2
+        sampleMode: mode,
+        sampleLink: 0,
+        sampleType: 4, // left channel
+        channels: 2,
       };
-      // Create the right-channel sample record
       const rightRecord = {
-        name: name + ' R',
+        name: name.slice(0, 17).replaceAll(' ', '') + '_R',
         pcm16: rightPCM,
         sampleRate: sr,
         rootNote: root,
         loopStart: start,
         loopEnd: end,
         sampleMode: mode,
-        sampleLink: 0,         // placeholder
-        sampleType: 2,         // right channel
+        sampleLink: 0,
+        sampleType: 2, // right channel
         channels: 2,
       };
 
-      // We'll push them in the array. We can fill in sampleLink afterwards once we know their final indexes.
       allSamples.push(leftRecord, rightRecord);
-
     } else {
       // ----- MONO sample -----
       const raw = userS.rawMonoData || new Float32Array([0]);
       const pcm16 = float32ToInt16(raw);
       const numFrames = pcm16.length;
-      const {mode, start, end} = computeLoop(numFrames);
+      const { mode, start, end } = computeLoop(numFrames);
 
       allSamples.push({
         name: name,
@@ -145,7 +139,7 @@ function prepareSamples(data) {
         loopEnd: end,
         sampleMode: mode,
         sampleLink: 0,
-        sampleType: 1,  // mono
+        sampleType: 1, // mono
         channels: 1,
       });
     }
@@ -154,44 +148,37 @@ function prepareSamples(data) {
   }
 
   // Now fix up sampleLink for stereo pairs
-  // We'll iterate through allSamples. If we find consecutive entries
-  // that share the same “parent name” + " L" / " R" and have channels=2, link them.
-  // This is somewhat simplistic; you might want a more robust pairing approach.
   for (let i = 0; i < allSamples.length - 1; i++) {
     const s1 = allSamples[i];
-    const s2 = allSamples[i+1];
+    const s2 = allSamples[i + 1];
     if (
       s1.channels === 2 &&
       s2.channels === 2 &&
-      s1.name.endsWith(' L') &&
-      s2.name.endsWith(' R') &&
+      s1.name.endsWith('_L') &&
+      s2.name.endsWith('_R') &&
       s1.name.slice(0, -2) === s2.name.slice(0, -2)
     ) {
-      // s1 is left, s2 is right
-      const leftIndex  = i;
-      const rightIndex = i+1;
-      s1.sampleLink = rightIndex;  // left links to right
-      s2.sampleLink = leftIndex;   // right links to left
+      const leftIndex = i;
+      const rightIndex = i + 1;
+      s1.sampleLink = rightIndex; // left links to right
+      s2.sampleLink = leftIndex; // right links to left
     }
   }
 
   return allSamples;
 }
 
-/**
- * Create note->sample mapping by picking the sample with the *closest* rootNote to each MIDI note.
- *
- * Returns an array of length 128. Each entry is the index in allSamples that is the best match.
- */
-function buildNoteToSampleIndex(allSamples) {
-  // For convenience, store the rootNote of each sample
-  const roots = allSamples.map(s => s.rootNote);
+// ---------------------------------------------------------------------------
+// BUILDING ZONES & WRITING THE SF2
+// ---------------------------------------------------------------------------
 
+function buildNoteToSampleIndex(allSamples) {
+  const roots = allSamples.map((s) => s.rootNote);
   const map = new Array(128);
+
   for (let note = 0; note < 128; note++) {
     let bestSampleID = 0;
     let bestDiff = Infinity;
-
     for (let sIdx = 0; sIdx < allSamples.length; sIdx++) {
       const diff = Math.abs(note - roots[sIdx]);
       if (diff < bestDiff) {
@@ -204,46 +191,58 @@ function buildNoteToSampleIndex(allSamples) {
   return map;
 }
 
-/**
- * Build a set of instrument zones (key ranges) from the note->sample mapping.
- * We'll group consecutive notes that map to the same sample into one zone.
- *
- * Returns an array of zone objects of the form:
- *   {
- *     keyLo: number,
- *     keyHi: number,
- *     sampleID: number,
- *     sampleMode: 0|1
- *   }
- */
 function buildInstrumentZones(allSamples, noteToSample) {
   const zones = [];
-  let currSample = noteToSample[0];
+
+  function pushZonesForRange(lo, hi, sampleID) {
+    // Create the main zone
+    const mainZone = {
+      keyLo: lo,
+      keyHi: hi,
+      sampleID,
+      sampleMode: allSamples[sampleID].sampleMode,
+      pan: 0, // default center
+    };
+
+    // If it's left or right, set a panning offset
+    // e.g. -500 => 100% left, +500 => 100% right
+    const s = allSamples[sampleID];
+    if (s.sampleType === 4) {
+      // left
+      mainZone.pan = -500;
+    } else if (s.sampleType === 2) {
+      // right
+      mainZone.pan = +500;
+    }
+
+    zones.push(mainZone);
+
+    // If it's stereo left => also push a second zone for the right sample
+    if (s.sampleType === 4 && s.sampleLink !== 0) {
+      const rightID = s.sampleLink;
+      const rightZone = {
+        keyLo: lo,
+        keyHi: hi,
+        sampleID: rightID,
+        sampleMode: allSamples[rightID].sampleMode,
+        pan: +500, // about 50% right
+      };
+      zones.push(rightZone);
+    }
+  }
+
   let zoneStart = 0;
+  let currSample = noteToSample[0];
 
   for (let note = 1; note < 128; note++) {
     const sID = noteToSample[note];
     if (sID !== currSample) {
-      // close out the previous zone
-      zones.push({
-        keyLo: zoneStart,
-        keyHi: note - 1,
-        sampleID: currSample,
-        sampleMode: allSamples[currSample].sampleMode
-      });
-      // start a new zone
+      pushZonesForRange(zoneStart, note - 1, currSample);
       zoneStart = note;
       currSample = sID;
     }
   }
-
-  // final zone
-  zones.push({
-    keyLo: zoneStart,
-    keyHi: 127,
-    sampleID: currSample,
-    sampleMode: allSamples[currSample].sampleMode
-  });
+  pushZonesForRange(zoneStart, 127, currSample);
 
   return zones;
 }
@@ -255,16 +254,15 @@ export function createSf2File(data) {
   // 2) For each note [0..127], find the sample with the closest rootNote
   const noteMap = buildNoteToSampleIndex(allSamples);
 
-  // 3) Group consecutive notes that share the same sample => instrument zones
+  // 3) Create instrument zones (including stereo R if needed), with pan
   const zoneDefs = buildInstrumentZones(allSamples, noteMap);
 
-  // 4) Prepare to write the SF2
+  // 4) Write the SF2
   const approximateSize = 4 * 1024 * 1024;
   const buffer = new ArrayBuffer(approximateSize);
   const view = new DataView(buffer);
   let offset = 0;
 
-  // Helper writers
   function writeUint32(val) {
     view.setUint32(offset, val, true);
     offset += 4;
@@ -294,7 +292,7 @@ export function createSf2File(data) {
 
     let chunkEnd = offset;
     let chunkSize = chunkEnd - chunkStart;
-    // Word align
+    // word-align
     if (chunkSize % 2 !== 0) {
       writeUint8(0);
       chunkEnd++;
@@ -302,28 +300,28 @@ export function createSf2File(data) {
     }
     const savedPos = offset;
     offset = sizeOffset;
-    writeUint32(chunkSize, true);
+    view.setUint32(offset, chunkSize, true);
     offset = savedPos;
   }
 
-  // ------------------------
-  // RIFF + sfbk
-  // ------------------------
+  // -----------------------------------------------------
+  //  RIFF + sfbk
+  // -----------------------------------------------------
   writeFourCC('RIFF');
   const totalSizeOffset = offset;
   writeUint32(0); // placeholder
   writeFourCC('sfbk');
 
-  // ------------------------
-  // LIST "INFO"
-  // ------------------------
+  // -----------------------------------------------------
+  //  LIST "INFO"
+  // -----------------------------------------------------
   writeChunk('LIST', () => {
     writeFourCC('INFO');
 
     // ifil
     writeChunk('ifil', () => {
-      writeUint16(2); // Major
-      writeUint16(1); // Minor
+      writeUint16(2); // major
+      writeUint16(1); // minor
     });
 
     // isng
@@ -356,19 +354,18 @@ export function createSf2File(data) {
     }
   });
 
-  // ------------------------
-  // LIST "sdta" => smpl
-  // ------------------------
+  // -----------------------------------------------------
+  //  LIST "sdta" => smpl
+  // -----------------------------------------------------
   writeChunk('LIST', () => {
     writeFourCC('sdta');
     writeChunk('smpl', () => {
-      // Write each sample + 46 guard points
       for (const s of allSamples) {
         const pcm = s.pcm16;
         for (let i = 0; i < pcm.length; i++) {
           writeUint16(pcm[i]);
         }
-        // Guard frames
+        // 46 guard frames
         for (let i = 0; i < 46; i++) {
           writeUint16(0);
         }
@@ -376,52 +373,63 @@ export function createSf2File(data) {
     });
   });
 
-  // ------------------------
-  // LIST "pdta"
-  // ------------------------
+  // -----------------------------------------------------
+  //  LIST "pdta"
+  // -----------------------------------------------------
   writeChunk('LIST', () => {
     writeFourCC('pdta');
 
-    // ---- phdr ----
+    // -------------------------
+    // phdr
+    // -------------------------
     writeChunk('phdr', () => {
-      // We create exactly 1 preset + terminal
+      // 1 preset => global preset region => actual region => terminal
       const presetName = data.name || 'Preset';
-      // Preset record (38 bytes)
       for (let i = 0; i < 20; i++) {
         writeUint8(i < presetName.length ? presetName.charCodeAt(i) : 0);
       }
       writeUint16(0); // preset=0
       writeUint16(0); // bank=0
-      writeUint16(0); // wPresetBagNdx=0
+      // wPresetBagNdx=0 => global preset bag
+      writeUint16(0);
       writeUint32(0); // dwLibrary
       writeUint32(0); // dwGenre
       writeUint32(0); // dwMorphology
 
-      // Terminal record "EOP"
+      // Terminal record
       const eopName = 'EOP';
       for (let i = 0; i < 20; i++) {
         writeUint8(i < eopName.length ? eopName.charCodeAt(i) : 0);
       }
       writeUint16(0);
       writeUint16(0);
-      writeUint16(1); // pbag index => after 1 bag
+      // 2 real preset bags => terminal is #2
+      writeUint16(2);
       writeUint32(0);
       writeUint32(0);
       writeUint32(0);
     });
 
-    // ---- pbag ----
+    // -------------------------
+    // pbag
+    // -------------------------
     writeChunk('pbag', () => {
-      // 1 bag + terminal => 2 records total
-      // bag #0 => references pgen #0
-      writeUint16(0); // wGenNdx
-      writeUint16(0); // wModNdx
-      // terminal
+      // Bag #0 => global => no gens
+      writeUint16(0);
+      writeUint16(0);
+
+      // Bag #1 => references pgen #0 => instrument=0
+      writeUint16(0);
+      writeUint16(0);
+
+      // Terminal => bag #2 => references pgen #1
       writeUint16(1);
       writeUint16(0);
     });
 
-    // ---- pmod ----
+    // -------------------------
+    // pmod
+    // -------------------------
     writeChunk('pmod', () => {
       // no modulators + terminal
       for (let i = 0; i < 10; i++) {
@@ -429,10 +437,12 @@ export function createSf2File(data) {
       }
     });
 
-    // ---- pgen ----
+    // -------------------------
+    // pgen
+    // -------------------------
     writeChunk('pgen', () => {
-      // One generator => instrument=0
-      // GenOper=41 => instrument
+      // no gens for global
+      // 1 gen => instrument=0 => GenOper=41
       writeUint16(41);
       writeUint16(0);
       // terminal
@@ -440,49 +450,60 @@ export function createSf2File(data) {
       writeUint16(0);
     });
 
-    // ---- inst ----
+    // -------------------------
+    // inst
+    // -------------------------
     writeChunk('inst', () => {
-      // 1 instrument => name, wInstBagNdx=0 => then terminal
+      // 1 instrument => global region => zoneDefs => then terminal
       const instName = data.name || 'Instrument';
       writeFixedAsciiString(view, offset, instName, 20);
       offset += 20;
-      // wInstBagNdx => first bag
+      // wInstBagNdx=0 => global region
       writeUint16(0);
 
       // "EOI"
       writeFixedAsciiString(view, offset, 'EOI', 20);
       offset += 20;
-      // wInstBagNdx => zoneDefs.length => next after all zones
-      writeUint16(zoneDefs.length);
+      // zoneDefs.length+1 => plus 1 for global
+      writeUint16(zoneDefs.length + 1);
     });
 
-    // ---- ibag ----
+    // -------------------------
+    // ibag
+    // -------------------------
     writeChunk('ibag', () => {
-      // We'll create one bag per zone, plus a terminal bag
-      // Each bag references the next generator index (in IGEN)
       let genOffset = 0;
 
-      // For each zone, we might have 2 or 3 generators:
-      //   keyRange (GenOper=43)
-      //   [sampleModes if looped => GenOper=54]
-      //   sampleID (GenOper=53)
+      // Bag #0 => global => no gens
+      writeUint16(0);
+      writeUint16(0);
+
+      // Bags for each zone
       for (let i = 0; i < zoneDefs.length; i++) {
-        writeUint16(genOffset); // wInstGenNdx
-        writeUint16(0);         // wInstModNdx => no modulators
-        // Count how many gens
+        writeUint16(genOffset);
+        writeUint16(0);
+
+        // keyRange + sampleID => 2 gens, plus loop => +1, plus pan => +1
+        // Let’s see if it has loop => that’s 1 extra, if pan => that’s another extra.
         let count = 2; // keyRange + sampleID
         if (zoneDefs[i].sampleMode === 1) {
+          count++;
+        }
+        // If pan != 0 => another generator
+        if (zoneDefs[i].pan) {
           count++;
         }
         genOffset += count;
       }
 
-      // Terminal bag
+      // terminal
       writeUint16(genOffset);
       writeUint16(0);
     });
 
-    // ---- imod ----
+    // -------------------------
+    // imod
+    // -------------------------
     writeChunk('imod', () => {
       // no modulators + terminal
       for (let i = 0; i < 10; i++) {
@@ -490,20 +511,27 @@ export function createSf2File(data) {
       }
     });
 
-    // ---- igen ----
+    // -------------------------
+    // igen
+    // -------------------------
     writeChunk('igen', () => {
-      // For each zone => keyRange, optional sampleModes, sampleID
+      // Global => no gens
       for (const z of zoneDefs) {
         // keyRange => GenOper=43
-        // 16-bit param: (hi << 8) | lo
         const keyRangeVal = (z.keyHi << 8) | z.keyLo;
         writeUint16(43);
         writeUint16(keyRangeVal);
 
-        // If loop => sampleModes => GenOper=54, value=1
+        // if loop => sampleModes=54 => 1
         if (z.sampleMode === 1) {
           writeUint16(54);
-          writeUint16(1); // loop_continuous
+          writeUint16(1);
+        }
+
+        // if pan != 0 => GenOper=17 => z.pan
+        if (z.pan) {
+          writeUint16(17); // pan
+          writeUint16(z.pan);
         }
 
         // sampleID => GenOper=53
@@ -511,15 +539,16 @@ export function createSf2File(data) {
         writeUint16(z.sampleID);
       }
 
-      // Terminal generator
+      // terminal
       writeUint16(0);
       writeUint16(0);
     });
 
-    // ---- shdr ----
+    // -------------------------
+    // shdr
+    // -------------------------
     writeChunk('shdr', () => {
       let startPos = 0;
-      // in the "shdr" chunk
       for (let i = 0; i < allSamples.length; i++) {
         const s = allSamples[i];
         writeFixedAsciiString(view, offset, s.name, 20);
@@ -529,33 +558,22 @@ export function createSf2File(data) {
         const endPos = startPos + numFrames;
 
         const realLoopStart = startPos + s.loopStart;
-        const realLoopEnd   = startPos + s.loopEnd;
+        const realLoopEnd = startPos + s.loopEnd;
 
-        // start
         writeUint32(startPos);
-        // end
         writeUint32(endPos);
-        // loopStart
         writeUint32(realLoopStart);
-        // loopEnd
         writeUint32(realLoopEnd);
-        // sampleRate
         writeUint32(s.sampleRate);
-        // originalPitch
         writeUint8(s.rootNote);
-        // pitchCorrection
-        writeUint8(0);
-
-        // sampleLink
+        writeUint8(0); // pitchCorrection
         writeUint16(s.sampleLink);
-        // sampleType
         writeUint16(s.sampleType);
 
-        // Move forward for the next sample's region
-        startPos += (numFrames + 46);
+        startPos += numFrames + 46;
       }
 
-      // Terminal sample: "EOS"
+      // Terminal sample => "EOS"
       writeFixedAsciiString(view, offset, 'EOS', 20);
       offset += 20;
       for (let i = 0; i < 5; i++) {
@@ -568,9 +586,8 @@ export function createSf2File(data) {
     });
   });
 
-  // Finalize
   const fileEnd = offset;
-  const riffSize = fileEnd - 8; // after "RIFF"
+  const riffSize = fileEnd - 8;
   view.setUint32(totalSizeOffset, riffSize, true);
 
   return new Blob([buffer.slice(0, fileEnd)], {
