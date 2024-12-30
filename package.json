@@ -1,1 +1,17 @@
-{"dependencies":{"chai":"^5.1.2","mocha":"^11.0.1","node-wav":"^0.0.2"}}
+{
+  "name": "sf2create",
+  "version": "0.0.1",
+  "description": "Create SF2 (SoundFont v2) files from WAV data.",
+  "main": "create-sf2.mjs",
+  "scripts": {
+    "test": "mocha"
+  },
+  "dependencies": {
+    "chai": "^5.1.2",
+    "mocha": "^11.0.1",
+    "node-wav": "^0.0.2"
+  },
+  "author": "Chris McCormick <chris@mccormick.cx>",
+  "license": "MIT",
+  "type": "module"
+}
