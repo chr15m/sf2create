@@ -459,9 +459,10 @@ export function createSf2File(data) {
     });
 
     // IENG (author)
-    if (data.author) {
+    const author = data.author || 'sf2create';
+    if (author) {
       writeChunk('IENG', () => {
-        const str = data.author;
+        const str = author;
         for (let i = 0; i < str.length; i++) {
           writeUint8(str.charCodeAt(i));
         }

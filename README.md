@@ -23,6 +23,7 @@ import fs from 'fs';
 // Define your sound data
 const soundData = {
   name: 'MySoundFont',
+  author: 'My Name', // Optional, defaults to the package name
   samples: [
     {
       name: 'piano',
