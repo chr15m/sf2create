@@ -639,9 +639,9 @@ export function createSf2File(data) {
         // scaleTuning=0 (no transposition)
         writeUint16(56);
         writeUint16(0);
-        // releaseVolEnv=12000 (long release)
+        // releaseVolEnv=8000 (long release, max value)
         writeUint16(38);
-        writeUint16(12000);
+        writeUint16(8000);
       }
 
       // Per-zone generators
