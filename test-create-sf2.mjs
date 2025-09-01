@@ -88,4 +88,30 @@ describe('createSf2File', () => {
     // but we can at least check the file is bigger than the sample alone
     expect(result.size).to.be.greaterThan(1000);
   });
+
+  it('Should generate a valid drumkit SF2 file', () => {
+    const kickSample = new Float32Array(10000).fill(0.9);
+    const snareSample = new Float32Array(10000).fill(0.7);
+
+    const data = {
+      name: 'TestDrumKit',
+      isDrumKit: true,
+      samples: [
+        {
+          name: 'kick', // will map to rootNote 36
+          rawMonoData: kickSample,
+          sampleRate: 44100,
+        },
+        {
+          name: 'snare', // will map to rootNote 38
+          rawMonoData: snareSample,
+          sampleRate: 44100,
+        },
+      ],
+    };
+
+    const result = createSf2File(data);
+    expect(result).to.be.instanceOf(Blob);
+    expect(result.size).to.be.greaterThan(1000);
+  });
 });

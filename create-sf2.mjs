@@ -9,6 +9,63 @@
 
 // 0. Helpful utilities
 
+const GM_DRUM_MAP_DEFAULTS = {
+  // General MIDI Drum Map: https://www.midi.org/specifications-old/item/gm-level-1-sound-set
+  'acoustic bass drum': { rootNote: 35 },
+  'bass drum 1': { rootNote: 36 },
+  kick: { rootNote: 36 },
+  'side stick': { rootNote: 37 },
+  'acoustic snare': { rootNote: 38 },
+  snare: { rootNote: 38 },
+  'hand clap': { rootNote: 39 },
+  'electric snare': { rootNote: 40 },
+  'low floor tom': { rootNote: 41 },
+  'closed hi-hat': { rootNote: 42, exclusiveClass: 1 },
+  closedhat: { rootNote: 42, exclusiveClass: 1 },
+  'high floor tom': { rootNote: 43 },
+  'pedal hi-hat': { rootNote: 44, exclusiveClass: 1 },
+  'low tom': { rootNote: 45 },
+  'open hi-hat': { rootNote: 46, exclusiveClass: 1 },
+  openhat: { rootNote: 46, exclusiveClass: 1 },
+  'low-mid tom': { rootNote: 47 },
+  'hi-mid tom': { rootNote: 48 },
+  'crash cymbal 1': { rootNote: 49 },
+  crash: { rootNote: 49 },
+  'high tom': { rootNote: 50 },
+  'ride cymbal 1': { rootNote: 51 },
+  ride: { rootNote: 51 },
+  'chinese cymbal': { rootNote: 52 },
+  'ride bell': { rootNote: 53 },
+  tambourine: { rootNote: 54 },
+  'splash cymbal': { rootNote: 55 },
+  cowbell: { rootNote: 56 },
+  'crash cymbal 2': { rootNote: 57 },
+  vibraslap: { rootNote: 58 },
+  'ride cymbal 2': { rootNote: 59 },
+  'hi bongo': { rootNote: 60 },
+  'low bongo': { rootNote: 61 },
+  'mute hi conga': { rootNote: 62 },
+  'open hi conga': { rootNote: 63 },
+  'low conga': { rootNote: 64 },
+  'high timbale': { rootNote: 65 },
+  'low timbale': { rootNote: 66 },
+  'high agogo': { rootNote: 67 },
+  'low agogo': { rootNote: 68 },
+  cabasa: { rootNote: 69 },
+  maracas: { rootNote: 70 },
+  'short whistle': { rootNote: 71 },
+  'long whistle': { rootNote: 72 },
+  'short guiro': { rootNote: 73 },
+  'long guiro': { rootNote: 74 },
+  claves: { rootNote: 75 },
+  'hi wood block': { rootNote: 76 },
+  'low wood block': { rootNote: 77 },
+  'mute cuica': { rootNote: 78 },
+  'open cuica': { rootNote: 79 },
+  'mute triangle': { rootNote: 80, exclusiveClass: 2 },
+  'open triangle': { rootNote: 81, exclusiveClass: 2 },
+};
+
 function float32ToInt16(floatArray) {
   const int16 = new Int16Array(floatArray.length);
   for (let i = 0; i < floatArray.length; i++) {
@@ -62,7 +119,18 @@ function prepareSamples(data) {
   for (const userS of data.samples) {
     const name = userS.name || `sample_${idx}`;
     const sr = userS.sampleRate || 44100;
-    const root = (userS.rootNote === undefined) ? 60 : userS.rootNote;
+
+    let root, originalPitch, exclusiveClass;
+    if (data.isDrumKit) {
+      const defaults = GM_DRUM_MAP_DEFAULTS[name.toLowerCase().trim()] || {};
+      root = userS.rootNote ?? defaults.rootNote ?? 60;
+      exclusiveClass = userS.exclusiveClass ?? defaults.exclusiveClass ?? 0;
+      originalPitch = 255;
+    } else {
+      root = (userS.rootNote === undefined) ? 60 : userS.rootNote;
+      originalPitch = root;
+      exclusiveClass = 0;
+    }
 
     function computeLoop(numFrames) {
       let mode = 0,
@@ -102,6 +170,8 @@ function prepareSamples(data) {
         pcm16: leftPCM,
         sampleRate: sr,
         rootNote: root,
+        originalPitch,
+        exclusiveClass,
         loopStart: start,
         loopEnd: end,
         sampleMode: mode,
@@ -114,6 +184,8 @@ function prepareSamples(data) {
         pcm16: rightPCM,
         sampleRate: sr,
         rootNote: root,
+        originalPitch,
+        exclusiveClass,
         loopStart: start,
         loopEnd: end,
         sampleMode: mode,
@@ -135,6 +207,8 @@ function prepareSamples(data) {
         pcm16,
         sampleRate: sr,
         rootNote: root,
+        originalPitch,
+        exclusiveClass,
         loopStart: start,
         loopEnd: end,
         sampleMode: mode,
@@ -247,17 +321,59 @@ function buildInstrumentZones(allSamples, noteToSample) {
   return zones;
 }
 
+function buildDrumKitZones(allSamples) {
+  const zones = [];
+  for (let i = 0; i < allSamples.length; i++) {
+    const s = allSamples[i];
+    // Right samples are handled via their left pair's sampleLink
+    if (s.sampleType === 2) continue;
+
+    const zone = {
+      keyLo: s.rootNote,
+      keyHi: s.rootNote,
+      sampleID: i,
+      sampleMode: s.sampleMode,
+      pan: 0,
+      exclusiveClass: s.exclusiveClass,
+    };
+
+    if (s.sampleType === 4) {
+      // left
+      zone.pan = -500;
+    }
+    zones.push(zone);
+
+    // If it's a stereo sample, we need a zone for the right channel too
+    if (s.sampleType === 4 && s.sampleLink !== 0) {
+      const rightID = s.sampleLink;
+      const rightZone = {
+        keyLo: s.rootNote,
+        keyHi: s.rootNote,
+        sampleID: rightID,
+        sampleMode: allSamples[rightID].sampleMode,
+        pan: +500,
+        exclusiveClass: s.exclusiveClass,
+      };
+      zones.push(rightZone);
+    }
+  }
+  return zones;
+}
+
 export function createSf2File(data) {
   // 1) Convert user samples -> allSamples
   const allSamples = prepareSamples(data);
 
-  // 2) For each note [0..127], find the sample with the closest rootNote
-  const noteMap = buildNoteToSampleIndex(allSamples);
+  // 2) Build zones based on instrument type (melodic vs. drum)
+  let zoneDefs;
+  if (data.isDrumKit) {
+    zoneDefs = buildDrumKitZones(allSamples);
+  } else {
+    const noteMap = buildNoteToSampleIndex(allSamples);
+    zoneDefs = buildInstrumentZones(allSamples, noteMap);
+  }
 
-  // 3) Create instrument zones (including stereo R if needed), with pan
-  const zoneDefs = buildInstrumentZones(allSamples, noteMap);
-
-  // 4) Write the SF2
+  // 3) Write the SF2
   const approximateSize = 4 * 1024 * 1024;
   const buffer = new ArrayBuffer(approximateSize);
   const view = new DataView(buffer);
@@ -389,7 +505,7 @@ export function createSf2File(data) {
         writeUint8(i < presetName.length ? presetName.charCodeAt(i) : 0);
       }
       writeUint16(0); // preset=0
-      writeUint16(0); // bank=0
+      writeUint16(data.isDrumKit ? 128 : 0); // bank=0 (or 128 for drums)
       // wPresetBagNdx=0 => global preset bag
       writeUint16(0);
       writeUint32(0); // dwLibrary
@@ -474,25 +590,23 @@ export function createSf2File(data) {
     writeChunk('ibag', () => {
       let genOffset = 0;
 
-      // Bag #0 => global => no gens
-      writeUint16(0);
-      writeUint16(0);
+      // Bag #0 => global instrument region
+      writeUint16(genOffset); // wGenNdx
+      writeUint16(0); // wModNdx
+      if (data.isDrumKit) {
+        genOffset += 2; // scaleTuning + releaseVolEnv
+      }
 
       // Bags for each zone
       for (let i = 0; i < zoneDefs.length; i++) {
         writeUint16(genOffset);
         writeUint16(0);
 
-        // keyRange + sampleID => 2 gens, plus loop => +1, plus pan => +1
-        // Let’s see if it has loop => that’s 1 extra, if pan => that’s another extra.
         let count = 2; // keyRange + sampleID
-        if (zoneDefs[i].sampleMode === 1) {
-          count++;
-        }
-        // If pan != 0 => another generator
-        if (zoneDefs[i].pan) {
-          count++;
-        }
+        if (zoneDefs[i].sampleMode === 1) count++;
+        if (zoneDefs[i].pan) count++;
+        if (data.isDrumKit && zoneDefs[i].exclusiveClass > 0) count++;
+
         genOffset += count;
       }
 
@@ -515,7 +629,17 @@ export function createSf2File(data) {
     // igen
     // -------------------------
     writeChunk('igen', () => {
-      // Global => no gens
+      // Global instrument generators (for drums)
+      if (data.isDrumKit) {
+        // scaleTuning=0 (no transposition)
+        writeUint16(56);
+        writeUint16(0);
+        // releaseVolEnv=12000 (long release)
+        writeUint16(38);
+        writeUint16(12000);
+      }
+
+      // Per-zone generators
       for (const z of zoneDefs) {
         // keyRange => GenOper=43
         const keyRangeVal = (z.keyHi << 8) | z.keyLo;
@@ -532,6 +656,12 @@ export function createSf2File(data) {
         if (z.pan) {
           writeUint16(17); // pan
           writeUint16(z.pan);
+        }
+
+        // if exclusiveClass > 0 (for drums)
+        if (data.isDrumKit && z.exclusiveClass > 0) {
+          writeUint16(57); // exclusiveClass
+          writeUint16(z.exclusiveClass);
         }
 
         // sampleID => GenOper=53
@@ -565,7 +695,7 @@ export function createSf2File(data) {
         writeUint32(realLoopStart);
         writeUint32(realLoopEnd);
         writeUint32(s.sampleRate);
-        writeUint8(s.rootNote);
+        writeUint8(s.originalPitch);
         writeUint8(0); // pitchCorrection
         writeUint16(s.sampleLink);
         writeUint16(s.sampleType);
