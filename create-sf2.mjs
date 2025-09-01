@@ -258,6 +258,9 @@ function buildNoteToSampleIndex(allSamples) {
     let bestSampleID = 0;
     let bestDiff = Infinity;
     for (let sIdx = 0; sIdx < allSamples.length; sIdx++) {
+      // For mapping, only consider mono or left samples as the primary sample
+      if (allSamples[sIdx].sampleType === 2) continue; // Skip right samples
+
       const diff = Math.abs(note - roots[sIdx]);
       if (diff < bestDiff) {
         bestDiff = diff;
@@ -611,6 +614,7 @@ export function createSf2File(data) {
         if (zoneDefs[i].sampleMode === 1) count++;
         if (zoneDefs[i].pan) count++;
         if (data.isDrumKit && zoneDefs[i].exclusiveClass > 0) count++;
+        if (data.isDrumKit) count++; // overridingRootKey
 
         genOffset += count;
       }
@@ -667,6 +671,12 @@ export function createSf2File(data) {
         if (data.isDrumKit && z.exclusiveClass > 0) {
           writeUint16(57); // exclusiveClass
           writeUint16(z.exclusiveClass);
+        }
+
+        // if drum kit, add overridingRootKey
+        if (data.isDrumKit) {
+          writeUint16(58); // overridingRootKey
+          writeUint16(z.keyLo);
         }
 
         // sampleID => GenOper=53
