@@ -111,6 +111,11 @@ async function main() {
   const samples = [];
 
   for (const wavPath of wavPaths) {
+    // This handles the case where a shell glob doesn't match any files
+    // and passes the literal glob string as an argument.
+    if (wavPath.includes('*') && !fs.existsSync(wavPath)) {
+      continue;
+    }
     const basename = path.basename(wavPath);
     const sampleName = basename.replace('.wav', '');
 
