@@ -1,6 +1,6 @@
 {
   "name": "sf2create",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Create SF2 (SoundFont v2) files from WAV data.",
   "main": "create-sf2.mjs",
   "scripts": {
