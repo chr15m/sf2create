@@ -1,2 +1,6 @@
 .*.swp
+.aider*
+.context
+*.sf2
+test-*
 node_modules
